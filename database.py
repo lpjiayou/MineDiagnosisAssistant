@@ -7,7 +7,38 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+class AutoClosingConnection(sqlite3.Connection):
+    """
+    SQLite连接子类。
 
+    使用方式：
+
+        with get_connection() as connection:
+            ...
+
+    退出with代码块时：
+    1. 正常则提交事务；
+    2. 异常则回滚事务；
+    3. 无论成功或失败，最终都会关闭数据库连接。
+    """
+
+    def __exit__(
+        self,
+        exception_type,
+        exception_value,
+        traceback,
+    ) -> bool:
+        try:
+            result = super().__exit__(
+                exception_type,
+                exception_value,
+                traceback,
+            )
+
+            return bool(result)
+
+        finally:
+            self.close()
 # ============================================================
 # 数据库路径
 # ============================================================
@@ -76,9 +107,10 @@ def get_connection() -> sqlite3.Connection:
     )
 
     connection = sqlite3.connect(
-        DB_PATH,
-        timeout=10,
-    )
+    DB_PATH,
+    timeout=10,
+    factory=AutoClosingConnection,
+)
 
     connection.row_factory = sqlite3.Row
 
