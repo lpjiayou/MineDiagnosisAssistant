@@ -1,25 +1,33 @@
-.venv/
-.env
-__pycache__/
-*.pyc
-# API密钥
-.env
-.env.*
-!.env.example
-
 # Python虚拟环境
 .venv/
 venv/
+
+# 密钥和环境配置
+.env
+.env.local
+.streamlit/secrets.toml
 
 # Python缓存
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# 运行日志
+# 日志文件
 logs/
 *.log
 
-# 编辑器配置
+# SQLite数据库
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.sqlite
+data/*.sqlite3
+
+# 编辑器本地配置
 .vscode/
 .idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
