@@ -1,0 +1,25 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+# API密钥
+.env
+.env.*
+!.env.example
+
+# Python虚拟环境
+.venv/
+venv/
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行日志
+logs/
+*.log
+
+# 编辑器配置
+.vscode/
+.idea/
