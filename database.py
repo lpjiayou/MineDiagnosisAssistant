@@ -952,7 +952,281 @@ def build_conversation_title(
         + "…"
     )
 
+# ============================================================
+# 第2.3阶段：历史会话搜索与空会话治理
+# ============================================================
 
+def search_conversations(
+    user_id: int,
+    query: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """
+    搜索用户历史会话。
+
+    搜索范围：
+    1. 会话标题
+    2. 用户消息和AI回答内容
+
+    query为空时，返回普通历史会话列表。
+    """
+
+    normalized_query = query.strip()
+
+    if not normalized_query:
+        return list_conversations(
+            user_id=user_id,
+            limit=limit,
+        )
+
+    safe_limit = max(
+        1,
+        min(limit, 200),
+    )
+
+    search_pattern = (
+        f"%{normalized_query}%"
+    )
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                conversations.*,
+
+                (
+                    SELECT COUNT(*)
+                    FROM messages
+                    WHERE messages.conversation_id =
+                          conversations.id
+                ) AS message_count
+
+            FROM conversations
+
+            WHERE conversations.user_id = ?
+
+              AND (
+                    conversations.title LIKE ?
+
+                    OR EXISTS (
+                        SELECT 1
+                        FROM messages
+                        WHERE messages.conversation_id =
+                              conversations.id
+
+                          AND messages.content LIKE ?
+                    )
+              )
+
+            ORDER BY conversations.updated_at DESC
+
+            LIMIT ?
+            """,
+            (
+                user_id,
+                search_pattern,
+                search_pattern,
+                safe_limit,
+            ),
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+def find_empty_conversation(
+    user_id: int,
+    work_mode: str,
+) -> dict[str, Any] | None:
+    """
+    查找某个用户、某种模式下最近创建的空会话。
+
+    空会话定义：
+    messages表中没有该会话的任何消息。
+    """
+
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                conversations.*,
+                0 AS message_count
+
+            FROM conversations
+
+            WHERE conversations.user_id = ?
+              AND conversations.work_mode = ?
+
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messages
+                    WHERE messages.conversation_id =
+                          conversations.id
+              )
+
+            ORDER BY conversations.updated_at DESC
+
+            LIMIT 1
+            """,
+            (
+                user_id,
+                work_mode,
+            ),
+        ).fetchone()
+
+    return row_to_dict(row)
+
+
+def create_or_reuse_conversation(
+    user_id: int,
+    work_mode: str,
+    title: str = "新对话",
+) -> tuple[dict[str, Any], bool]:
+    """
+    创建或复用空会话。
+
+    返回：
+    conversation：
+        会话数据。
+
+    created：
+        True表示创建了新会话。
+        False表示复用了已有空会话。
+
+    这样可以防止用户连续点击“新建对话”
+    导致数据库出现大量空会话。
+    """
+
+    empty_conversation = find_empty_conversation(
+        user_id=user_id,
+        work_mode=work_mode,
+    )
+
+    if empty_conversation is not None:
+        return empty_conversation, False
+
+    conversation = create_conversation(
+        user_id=user_id,
+        title=title,
+        work_mode=work_mode,
+    )
+
+    return conversation, True
+
+
+def cleanup_extra_empty_conversations(
+    user_id: int,
+    keep_conversation_id: str | None = None,
+) -> int:
+    """
+    清理用户已经堆积的多余空会话。
+
+    清理规则：
+    1. 当前会话不会删除。
+    2. 每种工作模式最多保留一个空会话。
+    3. 优先保留最近更新的空会话。
+    4. 有聊天消息的会话绝不会删除。
+
+    返回实际删除的空会话数量。
+    """
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                conversations.id,
+                conversations.work_mode,
+                conversations.updated_at
+
+            FROM conversations
+
+            WHERE conversations.user_id = ?
+
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messages
+                    WHERE messages.conversation_id =
+                          conversations.id
+              )
+
+            ORDER BY
+                conversations.work_mode ASC,
+                conversations.updated_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        empty_conversations = [
+            dict(row)
+            for row in rows
+        ]
+
+        keep_ids: set[str] = set()
+        kept_modes: set[str] = set()
+
+        # 当前会话如果为空，必须优先保留。
+        if keep_conversation_id:
+            for conversation in empty_conversations:
+                if (
+                    conversation["id"]
+                    == keep_conversation_id
+                ):
+                    keep_ids.add(
+                        conversation["id"]
+                    )
+
+                    kept_modes.add(
+                        conversation["work_mode"]
+                    )
+
+                    break
+
+        # 每种模式保留最近的一个空会话。
+        for conversation in empty_conversations:
+            conversation_id = conversation["id"]
+            work_mode = conversation["work_mode"]
+
+            if conversation_id in keep_ids:
+                continue
+
+            if work_mode not in kept_modes:
+                keep_ids.add(
+                    conversation_id
+                )
+
+                kept_modes.add(
+                    work_mode
+                )
+
+        delete_ids = [
+            conversation["id"]
+            for conversation in empty_conversations
+            if conversation["id"] not in keep_ids
+        ]
+
+        if not delete_ids:
+            return 0
+
+        connection.executemany(
+            """
+            DELETE FROM conversations
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            [
+                (
+                    conversation_id,
+                    user_id,
+                )
+                for conversation_id in delete_ids
+            ],
+        )
+
+        connection.commit()
+
+    return len(delete_ids)
 # ============================================================
 # 单独运行时初始化数据库
 # ============================================================

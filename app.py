@@ -10,7 +10,9 @@ from database import (
     add_message,
     build_conversation_title,
     check_daily_limit,
-    create_conversation,
+    cleanup_extra_empty_conversations,
+    create_or_reuse_conversation,
+    delete_conversation,
     get_conversation,
     get_messages,
     get_or_create_user,
@@ -18,6 +20,7 @@ from database import (
     init_database,
     list_conversations,
     rename_conversation,
+    search_conversations,
 )
 from opcua_client import read_all_tags_sync
 from prompts import PROMPT_VERSION
@@ -38,7 +41,7 @@ PLC_MODE = "PLC实时诊断模式"
 
 
 # ============================================================
-# 环境变量读取工具
+# 环境变量读取
 # ============================================================
 
 def get_int_env(
@@ -63,6 +66,7 @@ def get_int_env(
             name,
             default,
         )
+
         return default
 
 
@@ -144,16 +148,37 @@ current_user_id = int(current_user["id"])
 
 
 # ============================================================
-# 确保当前有一个有效会话
+# 清理已有的多余空会话
+# ============================================================
+
+if "empty_conversations_cleaned" not in st.session_state:
+    deleted_empty_count = (
+        cleanup_extra_empty_conversations(
+            user_id=current_user_id,
+            keep_conversation_id=(
+                st.session_state.get(
+                    "current_conversation_id"
+                )
+            ),
+        )
+    )
+
+    if deleted_empty_count > 0:
+        logger.info(
+            "已清理多余空会话，数量=%s",
+            deleted_empty_count,
+        )
+
+    st.session_state.empty_conversations_cleaned = True
+
+
+# ============================================================
+# 确保当前会话有效
 # ============================================================
 
 def ensure_current_conversation() -> dict[str, Any]:
     """
-    确保当前用户有一个有效会话。
-
-    优先恢复当前会话；
-    当前会话无效时恢复最近会话；
-    没有任何会话时创建通用问答会话。
+    保证当前用户始终有一个有效会话。
     """
 
     conversation_id = st.session_state.get(
@@ -178,10 +203,12 @@ def ensure_current_conversation() -> dict[str, Any]:
         conversation = conversations[0]
 
     else:
-        conversation = create_conversation(
-            user_id=current_user_id,
-            title="新对话",
-            work_mode=GENERAL_MODE,
+        conversation, _ = (
+            create_or_reuse_conversation(
+                user_id=current_user_id,
+                title="新对话",
+                work_mode=GENERAL_MODE,
+            )
         )
 
     st.session_state.current_conversation_id = (
@@ -192,8 +219,14 @@ def ensure_current_conversation() -> dict[str, Any]:
 
 
 current_conversation = ensure_current_conversation()
-current_conversation_id = current_conversation["id"]
-current_work_mode = current_conversation["work_mode"]
+
+current_conversation_id = (
+    current_conversation["id"]
+)
+
+current_work_mode = (
+    current_conversation["work_mode"]
+)
 
 
 # ============================================================
@@ -218,12 +251,12 @@ st.markdown(
 )
 
 st.caption(
-    "V2.0 Alpha：用户、会话与历史记录开发版本"
+    "V2.0 Alpha：历史会话管理开发版本"
 )
 
 
 # ============================================================
-# 配置自检
+# 配置检查
 # ============================================================
 
 deepseek_key_ok = bool(
@@ -241,14 +274,20 @@ opcua_url = os.getenv(
 opcua_config_ok = bool(opcua_url)
 tag_config_ok = len(OPCUA_TAGS) > 0
 
-
-# ============================================================
-# 每日调用次数
-# ============================================================
-
 usage_status = check_daily_limit(
     current_user_id
 )
+
+
+# ============================================================
+# 删除确认状态
+# ============================================================
+
+if "pending_delete_conversation_id" not in st.session_state:
+    st.session_state.pending_delete_conversation_id = None
+
+if "pending_delete_conversation_title" not in st.session_state:
+    st.session_state.pending_delete_conversation_title = None
 
 
 # ============================================================
@@ -272,25 +311,23 @@ with st.sidebar:
         f"用户角色：`{current_user['role']}`"
     )
 
+    st.write(
+        f"今日已调用：`{usage_status['used']}` 次"
+    )
+
     if usage_status["remaining"] is None:
-        st.write(
-            f"今日已调用：`{usage_status['used']}` 次"
-        )
         st.write("今日剩余：`不限制`")
 
     else:
         st.write(
-            f"今日已调用：`{usage_status['used']}` 次"
-        )
-
-        st.write(
-            f"今日剩余：`{usage_status['remaining']}` 次"
+            f"今日剩余："
+            f"`{usage_status['remaining']}` 次"
         )
 
     st.divider()
 
     # --------------------------------------------------------
-    # 新建会话
+    # 新建对话
     # --------------------------------------------------------
 
     st.markdown("### 新建对话")
@@ -300,20 +337,29 @@ with st.sidebar:
         use_container_width=True,
         type="primary",
     ):
-        new_conversation = create_conversation(
-            user_id=current_user_id,
-            title="新对话",
-            work_mode=GENERAL_MODE,
+        new_conversation, created = (
+            create_or_reuse_conversation(
+                user_id=current_user_id,
+                title="新对话",
+                work_mode=GENERAL_MODE,
+            )
         )
 
         st.session_state.current_conversation_id = (
             new_conversation["id"]
         )
 
-        logger.info(
-            "创建通用问答会话，会话ID=%s",
-            new_conversation["id"],
-        )
+        if created:
+            logger.info(
+                "创建通用问答会话，会话ID=%s",
+                new_conversation["id"],
+            )
+
+        else:
+            logger.info(
+                "复用已有通用问答空会话，会话ID=%s",
+                new_conversation["id"],
+            )
 
         st.rerun()
 
@@ -321,20 +367,29 @@ with st.sidebar:
         "新建PLC实时诊断",
         use_container_width=True,
     ):
-        new_conversation = create_conversation(
-            user_id=current_user_id,
-            title="新对话",
-            work_mode=PLC_MODE,
+        new_conversation, created = (
+            create_or_reuse_conversation(
+                user_id=current_user_id,
+                title="新对话",
+                work_mode=PLC_MODE,
+            )
         )
 
         st.session_state.current_conversation_id = (
             new_conversation["id"]
         )
 
-        logger.info(
-            "创建PLC实时诊断会话，会话ID=%s",
-            new_conversation["id"],
-        )
+        if created:
+            logger.info(
+                "创建PLC诊断会话，会话ID=%s",
+                new_conversation["id"],
+            )
+
+        else:
+            logger.info(
+                "复用已有PLC诊断空会话，会话ID=%s",
+                new_conversation["id"],
+            )
 
         st.rerun()
 
@@ -360,65 +415,172 @@ with st.sidebar:
         auto_fallback = st.checkbox(
             "PLC断线时自动降级为通用问答",
             value=True,
-            help=(
-                "启用后，PLC读取失败时，"
-                "AI仍可以提供通用排查建议，"
-                "但不会声称已经读取实时状态。"
+            key=(
+                f"auto_fallback_"
+                f"{current_conversation_id}"
             ),
         )
+
+    # --------------------------------------------------------
+    # 当前会话重命名
+    # --------------------------------------------------------
+
+    with st.expander(
+        "重命名当前会话",
+        expanded=False,
+    ):
+        new_conversation_title = st.text_input(
+            "新会话标题",
+            value=current_conversation["title"],
+            max_chars=50,
+            key=(
+                f"rename_input_"
+                f"{current_conversation_id}"
+            ),
+        )
+
+        if st.button(
+            "保存新标题",
+            use_container_width=True,
+            key=(
+                f"rename_save_"
+                f"{current_conversation_id}"
+            ),
+        ):
+            normalized_title = (
+                new_conversation_title.strip()
+            )
+
+            if not normalized_title:
+                st.error(
+                    "会话标题不能为空。"
+                )
+
+            else:
+                renamed = rename_conversation(
+                    conversation_id=(
+                        current_conversation_id
+                    ),
+                    user_id=current_user_id,
+                    new_title=normalized_title,
+                )
+
+                if renamed:
+                    logger.info(
+                        "会话重命名成功，会话ID=%s",
+                        current_conversation_id,
+                    )
+
+                    st.success(
+                        "会话标题修改成功。"
+                    )
+
+                    st.rerun()
+
+                else:
+                    st.error(
+                        "会话标题修改失败。"
+                    )
 
     st.divider()
 
     # --------------------------------------------------------
-    # 历史会话
+    # 历史会话搜索
     # --------------------------------------------------------
 
     st.markdown("### 历史会话")
 
-    conversations = list_conversations(
-        user_id=current_user_id,
-        limit=30,
+    conversation_search_query = st.text_input(
+        "搜索标题或聊天内容",
+        placeholder="例如：TON、PP01、变频器",
+        key="conversation_search_query",
     )
 
+    conversations = search_conversations(
+        user_id=current_user_id,
+        query=conversation_search_query,
+        limit=50,
+    )
+
+    if conversation_search_query:
+        st.caption(
+            f"找到 {len(conversations)} 个相关会话"
+        )
+
     if not conversations:
-        st.caption("暂无历史会话")
+        st.info("没有找到相关历史会话。")
+
+    # --------------------------------------------------------
+    # 历史会话列表
+    # --------------------------------------------------------
 
     for conversation in conversations:
         conversation_id = conversation["id"]
         conversation_title = conversation["title"]
         conversation_mode = conversation["work_mode"]
-        message_count = conversation["message_count"]
+        message_count = int(
+            conversation["message_count"]
+        )
 
         if conversation_mode == GENERAL_MODE:
             mode_icon = "💬"
         else:
             mode_icon = "📡"
 
-        if conversation_id == current_conversation_id:
+        if (
+            conversation_id
+            == current_conversation_id
+        ):
             active_mark = "▶ "
         else:
             active_mark = ""
 
-        button_text = (
-            f"{active_mark}{mode_icon} "
-            f"{conversation_title}"
+        select_column, delete_column = st.columns(
+            [6, 1]
         )
 
-        if st.button(
-            button_text,
-            key=f"history_{conversation_id}",
-            use_container_width=True,
-        ):
-            st.session_state.current_conversation_id = (
-                conversation_id
-            )
+        with select_column:
+            if st.button(
+                (
+                    f"{active_mark}{mode_icon} "
+                    f"{conversation_title}"
+                ),
+                key=(
+                    f"history_select_"
+                    f"{conversation_id}"
+                ),
+                use_container_width=True,
+            ):
+                st.session_state.current_conversation_id = (
+                    conversation_id
+                )
 
-            logger.info(
-                "切换历史会话，会话ID=%s",
-                conversation_id,
-            )
+                logger.info(
+                    "切换历史会话，会话ID=%s",
+                    conversation_id,
+                )
 
-            st.rerun()
+                st.rerun()
+
+        with delete_column:
+            if st.button(
+                "🗑️",
+                key=(
+                    f"history_delete_"
+                    f"{conversation_id}"
+                ),
+                help="删除该会话",
+                use_container_width=True,
+            ):
+                st.session_state.pending_delete_conversation_id = (
+                    conversation_id
+                )
+
+                st.session_state.pending_delete_conversation_title = (
+                    conversation_title
+                )
+
+                st.rerun()
 
         st.caption(
             f"{conversation_mode}｜"
@@ -426,10 +588,96 @@ with st.sidebar:
             f"{conversation['updated_at']}"
         )
 
+    # --------------------------------------------------------
+    # 删除二次确认
+    # --------------------------------------------------------
+
+    pending_delete_id = (
+        st.session_state.pending_delete_conversation_id
+    )
+
+    pending_delete_title = (
+        st.session_state.pending_delete_conversation_title
+    )
+
+    if pending_delete_id:
+        st.divider()
+
+        st.warning(
+            "确定删除会话："
+            f"“{pending_delete_title}”吗？\n\n"
+            "删除后，该会话中的全部聊天消息"
+            "也会被永久删除。"
+        )
+
+        confirm_column, cancel_column = st.columns(
+            2
+        )
+
+        with confirm_column:
+            if st.button(
+                "确认删除",
+                type="primary",
+                use_container_width=True,
+                key="confirm_delete_conversation",
+            ):
+                deleted = delete_conversation(
+                    conversation_id=(
+                        pending_delete_id
+                    ),
+                    user_id=current_user_id,
+                )
+
+                if deleted:
+                    logger.info(
+                        "会话删除成功，会话ID=%s",
+                        pending_delete_id,
+                    )
+
+                    if (
+                        pending_delete_id
+                        == current_conversation_id
+                    ):
+                        st.session_state.pop(
+                            "current_conversation_id",
+                            None,
+                        )
+
+                    st.session_state.pending_delete_conversation_id = (
+                        None
+                    )
+
+                    st.session_state.pending_delete_conversation_title = (
+                        None
+                    )
+
+                    st.rerun()
+
+                else:
+                    st.error(
+                        "会话删除失败或会话不存在。"
+                    )
+
+        with cancel_column:
+            if st.button(
+                "取消",
+                use_container_width=True,
+                key="cancel_delete_conversation",
+            ):
+                st.session_state.pending_delete_conversation_id = (
+                    None
+                )
+
+                st.session_state.pending_delete_conversation_title = (
+                    None
+                )
+
+                st.rerun()
+
     st.divider()
 
     # --------------------------------------------------------
-    # 配置自检
+    # 系统配置
     # --------------------------------------------------------
 
     with st.expander(
@@ -446,9 +694,12 @@ with st.sidebar:
         else:
             st.write("OPC UA地址：`未配置`")
 
-        st.write(
-            f"PLC变量：`{len(OPCUA_TAGS)}个`"
-        )
+        if tag_config_ok:
+            st.write(
+                f"PLC变量：`{len(OPCUA_TAGS)}个`"
+            )
+        else:
+            st.write("PLC变量：`未配置`")
 
         st.write("OPC UA模式：`只读`")
 
@@ -470,7 +721,7 @@ def format_message_meta(
     meta: dict[str, Any] | None,
 ) -> str:
     """
-    将数据库中的消息元数据转换成页面说明文字。
+    格式化AI回答下方的元数据。
     """
 
     if not meta:
@@ -512,7 +763,8 @@ def format_message_meta(
         and total_count is not None
     ):
         parts.append(
-            f"PLC读取：{success_count}/{total_count}"
+            f"PLC读取："
+            f"{success_count}/{total_count}"
         )
 
     prompt_version = meta.get(
@@ -528,27 +780,28 @@ def format_message_meta(
 
 
 # ============================================================
-# 主页面显示当前会话信息
+# 主页面当前会话信息
 # ============================================================
 
-st.subheader(current_conversation["title"])
+st.subheader(
+    current_conversation["title"]
+)
 
 if current_work_mode == GENERAL_MODE:
     st.info(
         "当前为通用问答会话。"
-        "本模式不会连接PLC，适合咨询PLC编程、"
-        "WinCC、仪表、控制原理及矿山自动化知识。"
+        "本模式不会连接PLC。"
     )
 
 else:
     st.info(
         "当前为PLC实时诊断会话。"
-        "每次发送问题时都会读取PLC最新状态快照。"
+        "每次提问时都会读取PLC最新状态快照。"
     )
 
 
 # ============================================================
-# 读取并显示当前会话历史消息
+# 显示数据库中的历史消息
 # ============================================================
 
 stored_messages = get_messages(
@@ -596,10 +849,6 @@ user_question = st.chat_input(
 # ============================================================
 
 if user_question:
-    # --------------------------------------------------------
-    # 检查每日调用次数
-    # --------------------------------------------------------
-
     latest_usage_status = check_daily_limit(
         current_user_id
     )
@@ -607,15 +856,11 @@ if user_question:
     if not latest_usage_status["allowed"]:
         st.error(
             "今天的AI调用次数已经达到上限。"
-            "请明天再试，或联系管理员调整限额。"
         )
 
         st.stop()
 
-    # --------------------------------------------------------
     # 保存用户消息
-    # --------------------------------------------------------
-
     add_message(
         conversation_id=current_conversation_id,
         role="user",
@@ -625,7 +870,7 @@ if user_question:
         },
     )
 
-    # 第一条问题自动生成会话标题
+    # 第一条消息自动生成标题
     if current_conversation["title"] == "新对话":
         generated_title = build_conversation_title(
             user_question,
@@ -641,17 +886,15 @@ if user_question:
     with st.chat_message("user"):
         st.markdown(user_question)
 
-    # --------------------------------------------------------
-    # 生成AI回答
-    # --------------------------------------------------------
-
     with st.chat_message("assistant"):
         with st.spinner(
             "正在分析，请稍候……"
         ):
             try:
                 recent_db_messages = get_messages(
-                    conversation_id=current_conversation_id,
+                    conversation_id=(
+                        current_conversation_id
+                    ),
                     limit=MAX_HISTORY_MESSAGES,
                 )
 
@@ -667,7 +910,6 @@ if user_question:
                     }
                 ]
 
-                answer = ""
                 assistant_meta: dict[str, Any] = {
                     "work_mode": current_work_mode,
                     "prompt_version": PROMPT_VERSION,
@@ -676,19 +918,17 @@ if user_question:
                 }
 
                 # ====================================================
-                # 通用问答模式
+                # 通用问答
                 # ====================================================
 
                 if current_work_mode == GENERAL_MODE:
                     mode_context = {
                         "role": "system",
                         "content": (
-                            "当前工作模式为通用问答模式。"
+                            "当前为通用问答模式。"
                             "本次没有读取PLC实时数据。"
-                            "可以回答PLC、WinCC、仪表、"
-                            "控制原理及矿山自动化问题。"
-                            "如果用户询问当前设备实时状态，"
-                            "必须明确说明没有实时PLC数据，"
+                            "用户询问当前设备实时状态时，"
+                            "必须说明没有实时PLC数据，"
                             "不得虚构设备状态。"
                         ),
                     }
@@ -702,7 +942,7 @@ if user_question:
                     )
 
                 # ====================================================
-                # PLC实时诊断模式
+                # PLC实时诊断
                 # ====================================================
 
                 else:
@@ -745,6 +985,7 @@ if user_question:
                                 snapshot_time = result[
                                     "snapshot_time"
                                 ]
+
                                 break
 
                         if success_count == 0:
@@ -756,7 +997,7 @@ if user_question:
                         plc_read_error = error
 
                         logger.error(
-                            "PLC实时读取失败，错误=%s",
+                            "PLC实时读取失败：%s",
                             error,
                         )
 
@@ -765,37 +1006,30 @@ if user_question:
                             latest_plc_data = None
 
                             st.warning(
-                                "PLC实时数据读取失败，"
-                                "本次请求已自动降级为通用问答。"
-                                "AI不会推测当前设备状态。"
+                                "PLC读取失败，"
+                                "本次已自动降级为通用问答。"
                             )
 
                         else:
                             raise ConnectionError(
-                                "PLC实时数据读取失败，"
-                                "并且未启用自动降级。"
+                                "PLC读取失败，"
+                                "且未启用自动降级。"
                                 f"错误：{error}"
                             ) from error
-
-                    # -----------------------------------------------
-                    # PLC读取成功
-                    # -----------------------------------------------
 
                     if not degraded_mode:
                         if failed_count > 0:
                             st.warning(
                                 f"成功读取{success_count}个变量，"
-                                f"读取失败{failed_count}个变量。"
-                                "读取失败不会被判断为False或0。"
+                                f"失败{failed_count}个变量。"
                             )
 
                         mode_context = {
                             "role": "system",
                             "content": (
-                                "当前工作模式为PLC实时诊断模式。"
+                                "当前为PLC实时诊断模式。"
                                 "本次PLC快照是唯一有效实时数据。"
-                                "历史聊天中的PLC数值均为旧快照，"
-                                "不得使用旧值代替本次读取结果。"
+                                "历史聊天中的PLC数值均为旧快照。"
                             ),
                         }
 
@@ -825,23 +1059,15 @@ if user_question:
                             }
                         )
 
-                    # -----------------------------------------------
-                    # PLC断线自动降级
-                    # -----------------------------------------------
-
                     else:
                         mode_context = {
                             "role": "system",
                             "content": (
-                                "当前原计划使用PLC实时诊断模式，"
-                                "但本次PLC数据读取失败，"
-                                "现已降级为通用问答。"
-                                "本次没有有效实时PLC数据。"
-                                "不得声称已经读取设备状态，"
-                                "不得推测Run、Remote、Fault、"
-                                "报警、联锁或命令的当前值。"
-                                "可以提供通用原因分析、"
-                                "检查步骤和建议补充的变量。"
+                                "PLC实时读取失败，"
+                                "本次已经降级为通用问答。"
+                                "没有有效的实时PLC数据。"
+                                "不得推测设备当前状态。"
+                                "可以提供通用检查步骤。"
                             ),
                         }
 
@@ -867,10 +1093,7 @@ if user_question:
                             }
                         )
 
-                # ----------------------------------------------------
                 # 保存AI回答
-                # ----------------------------------------------------
-
                 add_message(
                     conversation_id=current_conversation_id,
                     role="assistant",
@@ -878,23 +1101,19 @@ if user_question:
                     meta=assistant_meta,
                 )
 
-                # AI成功返回后才增加调用次数
+                # 成功调用后增加次数
                 increment_daily_usage(
                     current_user_id
                 )
 
                 logger.info(
-                    "聊天消息保存完成，"
-                    "用户ID=%s，会话ID=%s，模式=%s",
+                    "消息保存完成，用户ID=%s，"
+                    "会话ID=%s，模式=%s",
                     current_user_id,
                     current_conversation_id,
                     current_work_mode,
                 )
 
-                # 重新运行页面：
-                # 1. 更新会话标题
-                # 2. 更新每日次数
-                # 3. 从数据库重新加载消息
                 st.rerun()
 
             except AIClientError as error:
@@ -914,7 +1133,7 @@ if user_question:
 
             except Exception as error:
                 logger.exception(
-                    "聊天保存或诊断流程出现异常：%s",
+                    "请求处理异常：%s",
                     error,
                 )
 
