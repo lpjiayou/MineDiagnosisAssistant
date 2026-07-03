@@ -7,7 +7,38 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+class AutoClosingConnection(sqlite3.Connection):
+    """
+    SQLite连接子类。
 
+    使用方式：
+
+        with get_connection() as connection:
+            ...
+
+    退出with代码块时：
+    1. 正常则提交事务；
+    2. 异常则回滚事务；
+    3. 无论成功或失败，最终都会关闭数据库连接。
+    """
+
+    def __exit__(
+        self,
+        exception_type,
+        exception_value,
+        traceback,
+    ) -> bool:
+        try:
+            result = super().__exit__(
+                exception_type,
+                exception_value,
+                traceback,
+            )
+
+            return bool(result)
+
+        finally:
+            self.close()
 # ============================================================
 # 数据库路径
 # ============================================================
@@ -76,9 +107,10 @@ def get_connection() -> sqlite3.Connection:
     )
 
     connection = sqlite3.connect(
-        DB_PATH,
-        timeout=10,
-    )
+    DB_PATH,
+    timeout=10,
+    factory=AutoClosingConnection,
+)
 
     connection.row_factory = sqlite3.Row
 
@@ -617,9 +649,13 @@ def add_message(
     role: str,
     content: str,
     meta: dict[str, Any] | None = None,
+    user_id: int | None = None,
 ) -> dict[str, Any]:
     """
     保存一条聊天消息。
+
+    提供user_id时，会先检查该会话是否属于当前用户，
+    防止用户向其他用户的会话中写入消息。
     """
 
     if role not in {
@@ -649,6 +685,26 @@ def add_message(
         )
 
     with get_connection() as connection:
+        # 用户归属检查
+        if user_id is not None:
+            owner_row = connection.execute(
+                """
+                SELECT id
+                FROM conversations
+                WHERE id = ?
+                  AND user_id = ?
+                """,
+                (
+                    conversation_id,
+                    user_id,
+                ),
+            ).fetchone()
+
+            if owner_row is None:
+                raise PermissionError(
+                    "无权向该会话保存消息。"
+                )
+
         cursor = connection.execute(
             """
             INSERT INTO messages (
@@ -709,28 +765,74 @@ def add_message(
 
     return message
 
-
 def get_messages(
     conversation_id: str,
     limit: int | None = None,
+    user_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    获取会话中的消息。
+    获取指定会话中的消息。
 
-    消息按照创建顺序排列。
+    参数：
+    conversation_id：
+        会话ID。
+
+    limit：
+        最多返回多少条最近消息。
+        None表示返回全部消息。
+
+    user_id：
+        当前登录用户ID。
+        提供该参数时，只允许读取属于该用户的会话。
     """
 
     with get_connection() as connection:
+
+        # ====================================================
+        # 获取全部消息
+        # ====================================================
+
         if limit is None:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM messages
-                WHERE conversation_id = ?
-                ORDER BY id ASC
-                """,
-                (conversation_id,),
-            ).fetchall()
+
+            # 不检查用户归属
+            if user_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM messages
+                    WHERE conversation_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (
+                        conversation_id,
+                    ),
+                ).fetchall()
+
+            # 检查会话是否属于当前用户
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT messages.*
+                    FROM messages
+
+                    INNER JOIN conversations
+                        ON conversations.id =
+                           messages.conversation_id
+
+                    WHERE messages.conversation_id = ?
+                      AND conversations.user_id = ?
+
+                    ORDER BY messages.id ASC
+                    """,
+                    (
+                        conversation_id,
+                        user_id,
+                    ),
+                ).fetchall()
+
+        # ====================================================
+        # 只获取最近若干条消息
+        # ====================================================
 
         else:
             safe_limit = max(
@@ -738,23 +840,53 @@ def get_messages(
                 min(limit, 500),
             )
 
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM (
+            # 不检查用户归属
+            if user_id is None:
+                rows = connection.execute(
+                    """
                     SELECT *
-                    FROM messages
-                    WHERE conversation_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                )
-                ORDER BY id ASC
-                """,
-                (
-                    conversation_id,
-                    safe_limit,
-                ),
-            ).fetchall()
+                    FROM (
+                        SELECT *
+                        FROM messages
+                        WHERE conversation_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY id ASC
+                    """,
+                    (
+                        conversation_id,
+                        safe_limit,
+                    ),
+                ).fetchall()
+
+            # 检查会话是否属于当前用户
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM (
+                        SELECT messages.*
+                        FROM messages
+
+                        INNER JOIN conversations
+                            ON conversations.id =
+                               messages.conversation_id
+
+                        WHERE messages.conversation_id = ?
+                          AND conversations.user_id = ?
+
+                        ORDER BY messages.id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY id ASC
+                    """,
+                    (
+                        conversation_id,
+                        user_id,
+                        safe_limit,
+                    ),
+                ).fetchall()
 
     messages: list[dict[str, Any]] = []
 
@@ -770,8 +902,6 @@ def get_messages(
         messages.append(message)
 
     return messages
-
-
 # ============================================================
 # 每日调用次数管理
 # ============================================================
